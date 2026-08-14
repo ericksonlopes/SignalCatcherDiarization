@@ -36,12 +36,9 @@ class AudioDiarizer:
         self._device = _device_type
         self._compute_type = "float16" if self._device == "cuda" else "int8"
 
+        self.batch_size = batch_size
         if self._device == "cpu":
-            # batch_size=1 is more efficient on CPU (avoids memory thrashing)
-            self.batch_size = 1
-            logger.info("CPU mode enabled: batch_size=1")
-        else:
-            self.batch_size = batch_size
+            logger.info("CPU mode enabled: batch_size=%d (RAM destravada)", self.batch_size)
 
     def _transcribe(self, audio: np.ndarray, language: str | None) -> dict:
         logger.info(
