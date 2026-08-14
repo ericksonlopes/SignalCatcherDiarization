@@ -149,14 +149,17 @@ class AudioDiarizer:
         if progress_callback:
             progress_callback("TRANSCRIPTION")
         result_trans = self._transcribe(audio, language)
+        model_loader.unload_whisper() # FREE RAM
         
         if progress_callback:
             progress_callback("ALIGNMENT")
         result_aligned = self._align(result_trans, audio, language)
+        model_loader.unload_align() # FREE RAM
 
         if progress_callback:
             progress_callback("DIARIZATION")
         segments, lang = self._diarize(audio, result_aligned, num_speakers, min_speakers, max_speakers)
+        model_loader.unload_diarization() # FREE RAM
 
         return DiarizationResult(
             segments=segments,

@@ -38,7 +38,18 @@ class ModelLoader:
                 device=device
             )
         return self._diarization_pipeline
+    def unload_whisper(self):
+        self._whisper_model = None
+        import gc; gc.collect()
 
+    def unload_align(self):
+        self._align_model = None
+        self._align_metadata = None
+        import gc; gc.collect()
+
+    def unload_diarization(self):
+        self._diarization_pipeline = None
+        import gc; gc.collect()
 
 # Singleton instance
 model_loader = ModelLoader()
