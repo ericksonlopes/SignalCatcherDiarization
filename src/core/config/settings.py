@@ -9,9 +9,6 @@ class Settings(BaseSettings):
     POSTGRES_DATABASE: str
     POSTGRES_HOST: str
     LIST_LOG_LEVELS: Optional[str] = None
-    VOICE_MONKEY_API_TOKEN: Optional[str] = None
-    VOICE_MONKEY_NEW_VIDEO_FOR_DOWNLOAD_MONKEY_ID: Optional[str] = None
-    DOWNLOAD_YOUTUBE_PATH: Optional[str] = None
     HF_TOKEN: Optional[str] = None
 
     @property
