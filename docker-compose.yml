@@ -28,8 +28,10 @@ volumes:
     driver: local
     driver_opts:
       type: cifs
-      o: "username=guest,password=,vers=3.0"
-      device: "//eriberry/SSD_1"
+      # Utiliza usuário 'rasp' com senha 'rasp' como padrão, conforme a configuração do NAS.
+      # O IP foi fixado para garantir que a resolução não falhe.
+      o: "username=${SMB_USERNAME:-rasp},password=${SMB_PASSWORD:-rasp},vers=3.0"
+      device: "//192.168.1.12/SSD_1"
 
 networks:
   shared_postgres_network:

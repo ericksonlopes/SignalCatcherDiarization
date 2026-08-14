@@ -27,4 +27,4 @@ RUN groupadd --gid 1000 appuser \
 USER appuser
 
 # Roda as migrações do banco primeiro e depois inicia o servidor
-CMD ["/bin/sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["/bin/sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
