@@ -15,8 +15,9 @@ services:
       POSTGRES_DATABASE: ${POSTGRES_DATABASE-signalcatcher}
       LIST_LOG_LEVELS: ${LIST_LOG_LEVELS:-ERROR,WARNING,INFO}
       HF_TOKEN: ${HF_TOKEN:-}
+      DOWNLOAD_YOUTUBE_PATH: /nas_root
     volumes:
-      - nas_ssd:/youtube
+      - nas_ssd:/nas_root
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -28,5 +29,3 @@ volumes:
       type: cifs
       o: "username=${SMB_USERNAME:-rasp},password=${SMB_PASSWORD:-rasp},vers=3.0"
       device: "//192.168.1.12/SSD_1"
-
-

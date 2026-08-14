@@ -30,9 +30,9 @@ def process_pending_diarization_tasks_job():
     
     try:
         file_path = task.file_path
-        # Map samba path (/youtube/...) to local Windows path if running locally
-        if file_path.startswith("/youtube/") and settings.DOWNLOAD_YOUTUBE_PATH:
-            rel_path = file_path[len("/youtube/"):].lstrip("/\\")
+        # Map samba path (/youtube/..., /spotify/...) to local or container path
+        if settings.DOWNLOAD_YOUTUBE_PATH:
+            rel_path = file_path.lstrip("/\\")
             rel_path = rel_path.replace("/", os.sep)
             file_path = os.path.join(settings.DOWNLOAD_YOUTUBE_PATH, rel_path)
             
