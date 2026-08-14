@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     POSTGRES_HOST: str
     LIST_LOG_LEVELS: Optional[str] = None
     HF_TOKEN: Optional[str] = None
+    DOWNLOAD_YOUTUBE_PATH: Optional[str] = None
 
     @property
     def database_url(self) -> str:
