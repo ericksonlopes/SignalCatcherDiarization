@@ -1,0 +1,34 @@
+# Version control
+.git
+.gitignore
+.idea
+/script/test_audio.mp3
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.mypy_cache
+.pytest_cache
+*.egg-info
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Docs and misc
+LICENSE
+docs/
