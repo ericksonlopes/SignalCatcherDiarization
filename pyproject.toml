@@ -17,7 +17,20 @@ dependencies = [
     "huggingface-hub>=0.36.2",
     "python-multipart>=0.0.32",
     "apscheduler>=3.11.3",
+    "torch",
+    "torchvision",
+    "torchaudio",
 ]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 dev = [
