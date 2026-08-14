@@ -3,28 +3,33 @@ version: '3.8'
 services:
   app:
     build: .
-    container_name: signalcatcher_app
+    container_name: signalcatcherdiarization_app
     restart: unless-stopped
     user: "root"
     ports:
-      - "5001:8000"
+      - "8001:8000"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER-eriberry}
+      POSTGRES_USER: ${POSTGRES_USER-}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD-}
-      # Aponta para o nome do container do Postgres na outra stack
       POSTGRES_HOST: ${POSTGRES_HOST-postgresql}
       POSTGRES_DATABASE: ${POSTGRES_DATABASE-signalcatcher}
       LIST_LOG_LEVELS: ${LIST_LOG_LEVELS:-ERROR,WARNING,INFO}
-      VOICE_MONKEY_API_TOKEN: ${VOICE_MONKEY_API_TOKEN:-}
-      VOICE_MONKEY_NEW_VIDEO_FOR_DOWNLOAD_MONKEY_ID: ${VOICE_MONKEY_NEW_VIDEO_FOR_DOWNLOAD_MONKEY_ID:-}
-      DOWNLOAD_YOUTUBE_PATH: /app/youtube_downloads
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
-      - /media/eriberry/SSD_1/Youtube:/app/youtube_downloads
+      - nas_ssd:/youtube
     networks:
       - shared_postgres_network
     dns:
       - 8.8.8.8
       - 1.1.1.1
+
+volumes:
+  nas_ssd:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=guest,password=,vers=3.0"
+      device: "//eriberry/SSD_1"
 
 networks:
   shared_postgres_network:
