@@ -14,6 +14,7 @@ services:
       POSTGRES_HOST: ${POSTGRES_HOST-postgresql}
       POSTGRES_DATABASE: ${POSTGRES_DATABASE-signalcatcher}
       LIST_LOG_LEVELS: ${LIST_LOG_LEVELS:-ERROR,WARNING,INFO}
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - nas_ssd:/youtube
     networks:
