@@ -8,14 +8,15 @@ class ModelLoader:
         self._align_metadata = None
         self._diarization_pipeline = None
 
-    def get_whisper_model(self, model_size: str, device: str, compute_type: str, language: str | None = None):
+    def get_whisper_model(self, model_size: str, device: str, compute_type: str, language: str | None = None, threads: int = 4):
         """Loads and caches the whisper transcription model."""
         if self._whisper_model is None:
             self._whisper_model = whisperx.load_model(
                 model_size,
                 device,
                 compute_type=compute_type,
-                language=language
+                language=language,
+                threads=threads
             )
         return self._whisper_model
 

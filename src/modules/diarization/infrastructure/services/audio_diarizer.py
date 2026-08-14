@@ -57,6 +57,7 @@ class AudioDiarizer:
             self._device,
             compute_type=self._compute_type,
             language=language,
+            threads=_cpu_count if self._device == "cpu" else 4,
         )
 
         logger.info(
