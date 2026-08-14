@@ -38,7 +38,8 @@ class AudioDiarizer:
 
         self.batch_size = batch_size
         if self._device == "cpu":
-            logger.info("CPU mode enabled: batch_size=%d (RAM destravada)", self.batch_size)
+            self.batch_size = min(self.batch_size, 4)
+            logger.info("CPU mode enabled: batch_size=%d (limitado para evitar OOM)", self.batch_size)
 
     def _transcribe(self, audio: np.ndarray, language: str | None) -> dict:
         logger.info(
