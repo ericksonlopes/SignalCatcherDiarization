@@ -71,6 +71,15 @@ def process_pending_diarization_tasks_job():
         repository.update_task_step(task.id, step="COMPLETED", result_json=result_json)
         logger.info(f"Tarefa de diarização {task.id} finalizada com sucesso.")
         
+        # Limpeza total da memória (evita que o APScheduler ou threads segurem cache)
+        del diarizer
+        del result
+        del result_json
+        
     except Exception as e:
         logger.exception(f"Erro ao processar tarefa {task.id}")
         repository.update_task_step(task.id, step="ERROR", error_message=str(e))
+    finally:
+        # Garante que o Garbage Collector limpe tudo, mesmo se der erro
+        import gc
+        gc.collect()

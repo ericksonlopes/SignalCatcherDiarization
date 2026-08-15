@@ -156,11 +156,16 @@ class AudioDiarizer:
             progress_callback("ALIGNMENT")
         result_aligned = self._align(result_trans, audio, language)
         model_loader.unload_align() # FREE RAM
+        del result_trans # Libera o cache gigantesco da transcrição
 
         if progress_callback:
             progress_callback("DIARIZATION")
         segments, lang = self._diarize(audio, result_aligned, num_speakers, min_speakers, max_speakers)
         model_loader.unload_diarization() # FREE RAM
+        
+        del result_aligned
+        del audio # O áudio carregado pode pesar bastante
+        import gc; gc.collect()
 
         return DiarizationResult(
             segments=segments,
