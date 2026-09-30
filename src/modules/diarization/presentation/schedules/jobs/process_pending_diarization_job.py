@@ -3,16 +3,52 @@ import multiprocessing
 import os
 import queue
 import traceback
+from time import monotonic
 
 from src.core.config.settings import settings
-from src.modules.diarization.infrastructure.repositories.diarization_task_repository import DiarizationTaskRepository
-from src.modules.diarization.infrastructure.services.audio_diarizer import AudioDiarizer
+from src.modules.diarization.infrastructure.repositories.diarization_task_repository import (
+    DiarizationTaskRepository,
+)
 
 logger = logging.getLogger(__name__)
 
 
+class StageProgressReporter:
+    """Send at most one update per two seconds, plus the first and final values."""
+
+    def __init__(self, progress_queue):
+        self.queue = progress_queue
+        self.step = None
+        self.percent = -1
+        self.sent_at = 0.0
+
+    def __call__(self, step: str, percent: float):
+        value = max(0, min(100, int(percent)))
+        now = monotonic()
+        if step != self.step:
+            self.step, self.percent, self.sent_at = step, -1, 0.0
+        if value <= self.percent:
+            return
+        if self.percent >= 0 and value < 100 and now - self.sent_at < 2:
+            return
+        self.queue.put({"type": "stage_progress", "step": step, "percent": value})
+        self.percent, self.sent_at = value, now
+
+
 def _diarization_worker(k_dict, p_queue):
     try:
+        # Spawn starts with a fresh logging configuration. Use the same handler
+        # and level filtering as the API before loading the inference libraries.
+        from src.core.logger.logger import logger as app_logger
+
+        logging.basicConfig(
+            handlers=[app_logger.get_intercept_handler()],
+            level=logging.INFO,
+            force=True,
+        )
+        from src.modules.diarization.infrastructure.services.audio_diarizer import (
+            AudioDiarizer,
+        )
 
         diarizer = AudioDiarizer(
             hf_token=k_dict["hf_token"],
@@ -28,7 +64,8 @@ def _diarization_worker(k_dict, p_queue):
             num_speakers=k_dict["num_speakers"],
             min_speakers=k_dict["min_speakers"],
             max_speakers=k_dict["max_speakers"],
-            progress_callback=on_prog
+            progress_callback=on_prog,
+            stage_progress_callback=StageProgressReporter(p_queue),
         )
 
         res_json = {
@@ -55,9 +92,11 @@ def process_pending_diarization_tasks_job():
     task = pending_tasks[0]
     
     logger.info(f"Iniciando processamento da tarefa de diarização {task.id}")
-    repository.update_task_step(task.id, step="TRANSCRIPTION")
-    
+    p = None
+    progress_queue = None
+    worker_succeeded = False
     try:
+        repository.update_task_step(task.id, step="TRANSCRIPTION")
         file_path = task.file_path
         if settings.DOWNLOAD_YOUTUBE_PATH:
             rel_path = file_path.lstrip("/\\")
@@ -92,9 +131,12 @@ def process_pending_diarization_tasks_job():
                 msg = progress_queue.get(timeout=5.0)
                 if msg["type"] == "progress":
                     repository.update_task_step(task.id, step=msg["step"])
+                elif msg["type"] == "stage_progress":
+                    repository.update_task_progress(task.id, msg["step"], msg["percent"])
                 elif msg["type"] == "success":
                     repository.update_task_step(task.id, step="COMPLETED", result_json=msg["result"])
                     logger.info(f"Tarefa de diarização {task.id} finalizada com sucesso.")
+                    worker_succeeded = True
                     break
                 elif msg["type"] == "error":
                     logger.error(f"Erro no worker: {msg['traceback']}")
@@ -103,11 +145,28 @@ def process_pending_diarization_tasks_job():
                 if not p.is_alive():
                     raise RuntimeError("O processo de diarização morreu inesperadamente (possível falta de memória / OOM Killer).")
                     
-        p.join()
-        
     except Exception as e:
         logger.exception(f"Erro ao processar tarefa {task.id}")
         repository.update_task_step(task.id, step="ERROR", error_message=str(e))
     finally:
-        import gc
-        gc.collect()
+        # Do not leave inference running if persisting progress or results fails.
+        try:
+            if p is not None:
+                try:
+                    if p.pid is not None:
+                        if worker_succeeded:
+                            p.join(timeout=5.0)
+                        if p.is_alive():
+                            p.terminate()
+                            p.join(timeout=5.0)
+                        if p.is_alive():
+                            p.kill()
+                            p.join()
+                        else:
+                            p.join()
+                finally:
+                    p.close()
+        finally:
+            if progress_queue is not None:
+                progress_queue.close()
+                progress_queue.join_thread()

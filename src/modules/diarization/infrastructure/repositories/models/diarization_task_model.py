@@ -18,6 +18,7 @@ class DiarizationTaskModel(Base):
     entity_type = Column(String, nullable=True)
     
     # Parâmetros
+    progress_percent = Column(Integer, nullable=True)
     language = Column(String, nullable=True)
     num_speakers = Column(Integer, nullable=True)
     min_speakers = Column(Integer, nullable=True)
