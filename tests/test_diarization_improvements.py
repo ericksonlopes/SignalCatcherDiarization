@@ -167,6 +167,9 @@ class DiarizationImprovementTests(unittest.TestCase):
     def test_worker_claim_recovery_and_cancelled_result_are_guarded(self):
         repository = self.repo.DiarizationTaskRepository()
         task = repository.create_task("claim.wav")
+        with self.session_factory() as session:
+            session.get(self.model, task.id).queue_priority = 2
+            session.commit()
         self.assertTrue(repository.claim_task(task.id, "worker-one"))
         self.assertFalse(repository.claim_task(task.id, "worker-two"))
         self.assertTrue(repository.renew_task_lease(task.id, "worker-one"))

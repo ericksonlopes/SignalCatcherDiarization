@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from src.core.database.connector import ConnectorPostgres
@@ -127,7 +127,13 @@ class DiarizationTaskRepository:
             tasks = (
                 db.query(DiarizationTaskModel)
                 .filter(DiarizationTaskModel.step == "PENDING")
-                .order_by(DiarizationTaskModel.created_at.asc())
+                .order_by(
+                    DiarizationTaskModel.queue_priority.desc(),
+                    func.coalesce(
+                        DiarizationTaskModel.queued_at, DiarizationTaskModel.created_at
+                    ).asc(),
+                    DiarizationTaskModel.id.asc(),
+                )
                 .limit(limit)
                 .all()
             )
@@ -198,6 +204,24 @@ class DiarizationTaskRepository:
 
     def claim_task(self, task_id: str, token: str) -> bool:
         with ConnectorPostgres() as db:
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext('diarization:queue'))")
+                )
+            next_task = (
+                db.query(DiarizationTaskModel.id)
+                .filter(DiarizationTaskModel.step == "PENDING")
+                .order_by(
+                    DiarizationTaskModel.queue_priority.desc(),
+                    func.coalesce(
+                        DiarizationTaskModel.queued_at, DiarizationTaskModel.created_at
+                    ).asc(),
+                    DiarizationTaskModel.id.asc(),
+                )
+                .first()
+            )
+            if next_task is None or next_task[0] != task_id:
+                return False
             task = (
                 db.query(DiarizationTaskModel)
                 .filter(
@@ -210,6 +234,7 @@ class DiarizationTaskRepository:
             if task is None:
                 return False
             task.worker_token = token
+            task.queue_priority = 0
             task.lease_expires_at = datetime.now(timezone.utc).replace(
                 tzinfo=None
             ) + timedelta(seconds=LEASE_SECONDS)

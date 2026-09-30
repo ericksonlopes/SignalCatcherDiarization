@@ -134,7 +134,7 @@ def process_pending_diarization_tasks_job():
         last_heartbeat = monotonic()
 
         while True:
-            if monotonic() - last_heartbeat >= 15:
+            if monotonic() - last_heartbeat >= 5:
                 if not repository.renew_task_lease(task.id, worker_token):
                     raise RuntimeError("Task cancelled or worker ownership expired")
                 last_heartbeat = monotonic()
