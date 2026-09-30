@@ -3,18 +3,80 @@ import multiprocessing
 import os
 import queue
 import traceback
+from threading import Lock
 from time import monotonic
 from uuid import uuid4
 
+from sqlalchemy import text
+
 from src.core.config.settings import settings
+from src.core.database.connector import engine
 from src.modules.diarization.infrastructure.repositories.diarization_task_repository import (
     DiarizationTaskRepository,
 )
-from src.modules.diarization.infrastructure.services.execution_lock import (
-    DiarizationExecutionLock,
-)
 
 logger = logging.getLogger(__name__)
+
+
+EXECUTION_LOCK_ID = 73401953
+_local_lock = Lock()
+
+
+class DiarizationExecutionLock:
+    def __init__(self):
+        self.connection = None
+        self.acquired = False
+
+    def __enter__(self):
+        if engine.dialect.name != "postgresql":
+            self.acquired = _local_lock.acquire(blocking=False)
+            return self
+        self.connection = engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        )
+        try:
+            self.acquired = bool(
+                self.connection.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    {"key": EXECUTION_LOCK_ID},
+                ).scalar()
+            )
+        except Exception:
+            self.connection.invalidate()
+            self.connection.close()
+            raise
+        return self
+
+    def ensure_owned(self):
+        if not self.acquired:
+            raise RuntimeError("Diarization execution lock was not acquired")
+        if self.connection is not None:
+            owned = self.connection.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND pid = pg_backend_pid() AND objid = :key AND granted)"
+                ),
+                {"key": EXECUTION_LOCK_ID},
+            ).scalar()
+            if not owned:
+                raise RuntimeError("Diarization execution lock was lost")
+
+    def __exit__(self, *args):
+        if self.connection is not None:
+            try:
+                if self.acquired:
+                    self.connection.execute(
+                        text("SELECT pg_advisory_unlock(:key)"),
+                        {"key": EXECUTION_LOCK_ID},
+                    )
+            except Exception:
+                # Do not return a connection with an uncertain session lock to the pool.
+                self.connection.invalidate()
+            finally:
+                self.connection.close()
+        elif self.acquired:
+            _local_lock.release()
+        self.acquired = False
 
 
 class WorkerStopped(Exception):
