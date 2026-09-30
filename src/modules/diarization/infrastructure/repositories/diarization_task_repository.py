@@ -1,7 +1,18 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, text
+from sqlalchemy import (
+    Integer,
+    String,
+    and_,
+    case,
+    column,
+    func,
+    inspect,
+    or_,
+    table,
+    text,
+)
 from sqlalchemy.orm import Session
 
 from src.core.database.connector import ConnectorPostgres
@@ -122,21 +133,45 @@ class DiarizationTaskRepository:
                 db.expunge(task)
             return task
 
+    @staticmethod
+    def _pending_query(db: Session):
+        """Use the same queue order when listing and claiming the next task."""
+        query = db.query(DiarizationTaskModel).filter(
+            DiarizationTaskModel.step == "PENDING"
+        )
+        order = [DiarizationTaskModel.queue_priority.desc()]
+        # The main API stores durations in seconds. Standalone installations with
+        # uploaded files may not have its YouTube metadata table.
+        if inspect(db.connection()).has_table("youtube_contents"):
+            videos = table(
+                "youtube_contents",
+                column("external_id", String),
+                column("duration", Integer),
+            )
+            query = query.outerjoin(
+                videos,
+                and_(
+                    func.upper(DiarizationTaskModel.entity_type).in_(
+                        ("YOUTUBE", "YOUTUBE_VIDEO")
+                    ),
+                    videos.c.external_id == DiarizationTaskModel.entity_id,
+                ),
+            )
+            duration = case((videos.c.duration > 0, videos.c.duration), else_=None)
+            order.append(duration.asc().nulls_last())
+        order.extend(
+            [
+                func.coalesce(
+                    DiarizationTaskModel.queued_at, DiarizationTaskModel.created_at
+                ).asc(),
+                DiarizationTaskModel.id.asc(),
+            ]
+        )
+        return query.order_by(*order)
+
     def get_pending_tasks(self, limit: int = 5) -> list[DiarizationTaskModel]:
         with ConnectorPostgres() as db:
-            tasks = (
-                db.query(DiarizationTaskModel)
-                .filter(DiarizationTaskModel.step == "PENDING")
-                .order_by(
-                    DiarizationTaskModel.queue_priority.desc(),
-                    func.coalesce(
-                        DiarizationTaskModel.queued_at, DiarizationTaskModel.created_at
-                    ).asc(),
-                    DiarizationTaskModel.id.asc(),
-                )
-                .limit(limit)
-                .all()
-            )
+            tasks = self._pending_query(db).limit(limit).all()
             for task in tasks:
                 db.expunge(task)
             return tasks
@@ -216,16 +251,7 @@ class DiarizationTaskRepository:
             ):
                 return False
             next_task = (
-                db.query(DiarizationTaskModel.id)
-                .filter(DiarizationTaskModel.step == "PENDING")
-                .order_by(
-                    DiarizationTaskModel.queue_priority.desc(),
-                    func.coalesce(
-                        DiarizationTaskModel.queued_at, DiarizationTaskModel.created_at
-                    ).asc(),
-                    DiarizationTaskModel.id.asc(),
-                )
-                .first()
+                self._pending_query(db).with_entities(DiarizationTaskModel.id).first()
             )
             if next_task is None or next_task[0] != task_id:
                 return False
