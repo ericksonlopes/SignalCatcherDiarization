@@ -1,4 +1,5 @@
 import gc
+import importlib
 import inspect
 import logging
 import os
@@ -186,6 +187,13 @@ class AudioDiarizer:
     def _progress_kwargs(function, callback) -> dict:
         # Older WhisperX installations can still process audio without reporting
         # numerical progress. Do not fabricate a percentage in that case.
+        # The public align() is a lazy wrapper with (*args, **kwargs), so inspect
+        # its implementation instead of treating the wrapper as unsupported.
+        if (
+            getattr(function, "__module__", None) == "whisperx"
+            and getattr(function, "__name__", None) == "align"
+        ):
+            function = importlib.import_module("whisperx.alignment").align
         if callback is not None and "progress_callback" in inspect.signature(function).parameters:
             return {"progress_callback": callback}
         return {}

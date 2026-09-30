@@ -14,6 +14,34 @@ from src.modules.diarization.infrastructure.repositories.diarization_task_reposi
 logger = logging.getLogger(__name__)
 
 
+class WorkerStopped(Exception):
+    """The task no longer authorizes this subprocess to continue."""
+
+
+def _handle_worker_stop(repository, task_id: str, worker_token: str) -> None:
+    current = repository.get_task(task_id)
+    if current is None:
+        logger.info("Processamento %s encerrado: tarefa removida.", task_id)
+    elif current.step == "PENDING":
+        logger.info("Processamento %s interrompido: tarefa devolvida à fila.", task_id)
+    elif current.step == "CANCELLED":
+        logger.info("Processamento %s interrompido: tarefa cancelada.", task_id)
+    elif current.worker_token != worker_token:
+        logger.info("Processamento %s encerrado: execução substituída.", task_id)
+    else:
+        # A heartbeat timeout is distinct from a user's queue/cancel action.
+        # Ownership guards prevent this from overwriting a concurrent new attempt.
+        logger.warning(
+            "Processamento %s encerrado: prazo de atividade do worker expirou.", task_id
+        )
+        repository.update_task_step(
+            task_id,
+            step="CANCELLED",
+            worker_token=worker_token,
+            error_message="Processing interrupted: worker activity lease expired.",
+        )
+
+
 class StageProgressReporter:
     """Send at most one update per two seconds, plus the first and final values."""
 
@@ -136,7 +164,7 @@ def process_pending_diarization_tasks_job():
         while True:
             if monotonic() - last_heartbeat >= 5:
                 if not repository.renew_task_lease(task.id, worker_token):
-                    raise RuntimeError("Task cancelled or worker ownership expired")
+                    raise WorkerStopped()
                 last_heartbeat = monotonic()
             try:
                 msg = progress_queue.get(timeout=5.0)
@@ -144,7 +172,7 @@ def process_pending_diarization_tasks_job():
                     if not repository.update_task_step(
                         task.id, step=msg["step"], worker_token=worker_token
                     ):
-                        raise RuntimeError("Task no longer belongs to this worker")
+                        raise WorkerStopped()
                 elif msg["type"] == "stage_progress":
                     repository.update_task_progress(
                         task.id, msg["step"], msg["percent"], worker_token=worker_token
@@ -156,7 +184,7 @@ def process_pending_diarization_tasks_job():
                         result_json=msg["result"],
                         worker_token=worker_token,
                     ):
-                        raise RuntimeError("Task no longer belongs to this worker")
+                        raise WorkerStopped()
                     logger.info(
                         f"Tarefa de diarização {task.id} finalizada com sucesso."
                     )
@@ -171,6 +199,8 @@ def process_pending_diarization_tasks_job():
                         "O processo de diarização morreu inesperadamente (possível falta de memória / OOM Killer)."
                     )
 
+    except WorkerStopped:
+        _handle_worker_stop(repository, task.id, worker_token)
     except Exception as e:
         logger.exception(f"Erro ao processar tarefa {task.id}")
         repository.update_task_step(

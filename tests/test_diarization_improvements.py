@@ -312,6 +312,32 @@ class DiarizationImprovementTests(unittest.TestCase):
             )
         self.assertEqual(result["language"], "pt")
 
+    def test_lazy_alignment_wrapper_forwards_percentage_callback(self):
+        values = []
+        implementation = ModuleType("whisperx.alignment")
+
+        def internal_align(*args, progress_callback=None, **kwargs):
+            progress_callback(35)
+            return {"segments": []}
+
+        implementation.align = internal_align
+
+        def align(*args, **kwargs):
+            return internal_align(*args, **kwargs)
+
+        align.__module__ = "whisperx"
+        with (
+            patch.dict(sys.modules, {"whisperx.alignment": implementation}),
+            patch.object(self.whisperx, "align", align),
+            patch.object(
+                self.audio.model_loader, "get_align_model", return_value=(object(), {})
+            ),
+        ):
+            self.audio.AudioDiarizer("token")._align(
+                {"segments": [], "language": "pt"}, object(), None, values.append
+            )
+        self.assertEqual(values, [0, 35, 100])
+
     def test_failed_alignment_preserves_original_transcript(self):
         original = {"segments": [], "language": "pt"}
         with patch.object(
@@ -462,7 +488,14 @@ class DiarizationImprovementTests(unittest.TestCase):
         self.assertEqual(values, [])
         self.assertEqual(result["language"], "pt")
 
-    def _run_job(self, messages, update_effect=None, start_error=None, alive=True):
+    def _run_job(
+        self,
+        messages,
+        update_effect=None,
+        start_error=None,
+        alive=True,
+        stopped_step="PENDING",
+    ):
         repository = MagicMock()
         repository.get_pending_tasks.return_value = [
             SimpleNamespace(
@@ -478,6 +511,9 @@ class DiarizationImprovementTests(unittest.TestCase):
         repository.update_task_step.side_effect = update_effect
         repository.claim_task.return_value = True
         repository.renew_task_lease.return_value = True
+        repository.get_task.return_value = SimpleNamespace(
+            step=stopped_step, worker_token=None
+        )
         process = MagicMock()
         process.pid = None if start_error else 123
         process.start.side_effect = start_error
@@ -508,6 +544,36 @@ class DiarizationImprovementTests(unittest.TestCase):
         process.terminate.assert_called_once()
         process.join.assert_any_call(timeout=5.0)
         self.assertEqual(repository.update_task_step.call_args.kwargs["step"], "ERROR")
+
+    def test_requeued_or_cancelled_task_is_not_logged_as_processing_error(self):
+        for step in ["PENDING", "CANCELLED"]:
+            with (
+                self.subTest(step=step),
+                self.assertLogs(self.job.logger, level="INFO") as logs,
+            ):
+                process, repository = self._run_job(
+                    [{"type": "progress", "step": "ALIGNMENT"}],
+                    update_effect=[False],
+                    stopped_step=step,
+                )
+            process.terminate.assert_called_once()
+            self.assertEqual(repository.update_task_step.call_count, 1)
+            self.assertTrue(all(record.levelno < 30 for record in logs.records))
+
+    def test_expired_owner_is_reported_separately_and_cancelled(self):
+        repository = MagicMock()
+        repository.get_task.return_value = SimpleNamespace(
+            step="ALIGNMENT", worker_token="owner"
+        )
+        with self.assertLogs(self.job.logger, level="WARNING") as logs:
+            self.job._handle_worker_stop(repository, "task", "owner")
+        repository.update_task_step.assert_called_once_with(
+            "task",
+            step="CANCELLED",
+            worker_token="owner",
+            error_message="Processing interrupted: worker activity lease expired.",
+        )
+        self.assertEqual(logs.records[0].levelno, 30)
 
     def test_success_waits_for_child_without_terminating_it(self):
         process, repository = self._run_job(
