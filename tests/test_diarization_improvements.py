@@ -184,8 +184,8 @@ class DiarizationImprovementTests(unittest.TestCase):
         self.assertFalse(
             repository.update_task_step(task.id, "COMPLETED", worker_token="worker-one")
         )
-        self.assertEqual(repository.get_task(task.id).step, "CANCELLED")
-        self.assertEqual(self._history(task.id)[-1]["new_step"], "CANCELLED")
+        self.assertEqual(repository.get_task(task.id).step, "PENDING")
+        self.assertEqual(self._history(task.id)[-1]["new_step"], "PENDING")
 
     def test_duplicate_worker_requests_reuse_active_task(self):
         repository = self.repo.DiarizationTaskRepository()
@@ -196,6 +196,36 @@ class DiarizationImprovementTests(unittest.TestCase):
             "repeat.wav", entity_id="repeat-video", entity_type="YOUTUBE"
         )
         self.assertEqual(first.id, second.id)
+
+    def test_only_one_execution_lock_can_be_held(self):
+        with self.job.DiarizationExecutionLock() as first:
+            self.assertTrue(first.acquired)
+            with self.job.DiarizationExecutionLock() as second:
+                self.assertFalse(second.acquired)
+            first.ensure_owned()
+        with self.job.DiarizationExecutionLock() as next_run:
+            self.assertTrue(next_run.acquired)
+
+    def test_restart_requeues_unexpired_task_and_claim_refuses_second_execution(self):
+        repository = self.repo.DiarizationTaskRepository()
+        repository.recover_interrupted_tasks(force=True)
+        first = repository.create_task("restart-one.wav")
+        second = repository.create_task("restart-two.wav")
+        with self.session_factory() as session:
+            session.get(self.model, first.id).queue_priority = 3
+            session.commit()
+        self.assertTrue(repository.claim_task(first.id, "first-owner"))
+        self.assertFalse(repository.claim_task(second.id, "second-owner"))
+        self.assertEqual(repository.recover_interrupted_tasks(force=True), 1)
+        restored = repository.get_task(first.id)
+        self.assertEqual(restored.step, "PENDING")
+        self.assertIsNone(restored.worker_token)
+        self.assertIsNone(restored.progress_percent)
+        self.assertFalse(
+            repository.update_task_step(
+                first.id, "COMPLETED", worker_token="first-owner"
+            )
+        )
 
     def test_progress_updates_are_monotonic_and_do_not_add_history(self):
         repository = self.repo.DiarizationTaskRepository()
@@ -560,19 +590,15 @@ class DiarizationImprovementTests(unittest.TestCase):
             self.assertEqual(repository.update_task_step.call_count, 1)
             self.assertTrue(all(record.levelno < 30 for record in logs.records))
 
-    def test_expired_owner_is_reported_separately_and_cancelled(self):
+    def test_expired_owner_is_reported_separately_and_requeued(self):
         repository = MagicMock()
         repository.get_task.return_value = SimpleNamespace(
             step="ALIGNMENT", worker_token="owner"
         )
         with self.assertLogs(self.job.logger, level="WARNING") as logs:
             self.job._handle_worker_stop(repository, "task", "owner")
-        repository.update_task_step.assert_called_once_with(
-            "task",
-            step="CANCELLED",
-            worker_token="owner",
-            error_message="Processing interrupted: worker activity lease expired.",
-        )
+        repository.recover_interrupted_tasks.assert_called_once_with()
+        repository.update_task_step.assert_not_called()
         self.assertEqual(logs.records[0].levelno, 30)
 
     def test_success_waits_for_child_without_terminating_it(self):

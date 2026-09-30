@@ -10,6 +10,9 @@ from src.core.config.settings import settings
 from src.modules.diarization.infrastructure.repositories.diarization_task_repository import (
     DiarizationTaskRepository,
 )
+from src.modules.diarization.infrastructure.services.execution_lock import (
+    DiarizationExecutionLock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +37,7 @@ def _handle_worker_stop(repository, task_id: str, worker_token: str) -> None:
         logger.warning(
             "Processamento %s encerrado: prazo de atividade do worker expirou.", task_id
         )
-        repository.update_task_step(
-            task_id,
-            step="CANCELLED",
-            worker_token=worker_token,
-            error_message="Processing interrupted: worker activity lease expired.",
-        )
+        repository.recover_interrupted_tasks()
 
 
 class StageProgressReporter:
@@ -110,11 +108,26 @@ def _diarization_worker(k_dict, p_queue):
 
 
 def process_pending_diarization_tasks_job():
+    with DiarizationExecutionLock() as execution:
+        if not execution.acquired:
+            logger.debug("Outro worker já está executando uma diarização.")
+            return
+        _process_pending_diarization_tasks_job(execution)
+
+
+def _process_pending_diarization_tasks_job(execution):
     """Busca tarefas pendentes na fila e as processa uma por uma."""
     logger.debug("Executando job de diarização...")
 
     repository = DiarizationTaskRepository()
-    repository.recover_interrupted_tasks()
+    # An exclusive execution lock proves the previous owner has exited. Recover
+    # even unexpired or legacy task leases, which otherwise appear active after restart.
+    recovered = repository.recover_interrupted_tasks(force=True)
+    if recovered:
+        logger.info(
+            "%s tarefas interrompidas devolvidas à fila para reprocessamento.",
+            recovered,
+        )
 
     pending_tasks = repository.get_pending_tasks(limit=1)
 
@@ -163,6 +176,7 @@ def process_pending_diarization_tasks_job():
 
         while True:
             if monotonic() - last_heartbeat >= 5:
+                execution.ensure_owned()
                 if not repository.renew_task_lease(task.id, worker_token):
                     raise WorkerStopped()
                 last_heartbeat = monotonic()

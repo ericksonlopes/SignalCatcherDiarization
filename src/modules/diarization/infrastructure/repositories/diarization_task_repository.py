@@ -208,6 +208,13 @@ class DiarizationTaskRepository:
                 db.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext('diarization:queue'))")
                 )
+            if (
+                db.query(DiarizationTaskModel.id)
+                .filter(DiarizationTaskModel.step.in_(ACTIVE_STEPS))
+                .first()
+                is not None
+            ):
+                return False
             next_task = (
                 db.query(DiarizationTaskModel.id)
                 .filter(DiarizationTaskModel.step == "PENDING")
@@ -265,32 +272,40 @@ class DiarizationTaskRepository:
             db.commit()
             return count == 1
 
-    def recover_interrupted_tasks(self, include_legacy: bool = False) -> int:
+    def recover_interrupted_tasks(
+        self, include_legacy: bool = False, force: bool = False
+    ) -> int:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         with ConnectorPostgres() as db:
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext('diarization:queue'))")
+                )
             expired = DiarizationTaskModel.lease_expires_at <= now
             if include_legacy:
                 expired = or_(expired, DiarizationTaskModel.lease_expires_at.is_(None))
-            tasks = (
-                db.query(DiarizationTaskModel)
-                .filter(
-                    DiarizationTaskModel.step.in_(ACTIVE_STEPS),
-                    expired,
-                )
-                .with_for_update(skip_locked=True)
-                .all()
+            query = db.query(DiarizationTaskModel).filter(
+                DiarizationTaskModel.step.in_(ACTIVE_STEPS)
             )
+            if not force:
+                query = query.filter(expired)
+            tasks = query.with_for_update(skip_locked=True).all()
             for task in tasks:
                 previous = task.step
-                task.step = "CANCELLED"
+                task.step = "PENDING"
                 task.progress_percent = None
                 task.worker_token = None
                 task.lease_expires_at = None
-                task.error_message = (
-                    "Processing interrupted: worker stopped renewing its lease."
-                )
+                task.result_json = None
+                task.error_message = None
+                task.queue_priority = 2
+                task.queued_at = now
                 self._record_transition(
-                    db, task, previous, "CANCELLED", task.error_message
+                    db,
+                    task,
+                    previous,
+                    "PENDING",
+                    "Worker interrupted; queued for automatic reprocessing.",
                 )
             db.commit()
             return len(tasks)
