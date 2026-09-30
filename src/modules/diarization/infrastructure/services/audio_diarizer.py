@@ -58,7 +58,8 @@ class AudioDiarizer:
             self.batch_size = min(self.batch_size, 4)
             logger.info("CPU mode enabled: batch_size=%d (limitado para evitar OOM)", self.batch_size)
 
-    def _transcribe(self, audio: np.ndarray, language: str | None) -> dict:
+    def _transcribe(self, audio: np.ndarray, language: str | None,
+                    progress_callback: Callable[[float], None] | None = None) -> dict:
         logger.info(
             "[1/3] Transcription starting (model=%s, device=%s, compute=%s)",
             self.model_size,
@@ -82,7 +83,15 @@ class AudioDiarizer:
         )
 
         with _measure_time("transcription inference"):
-            result = model.transcribe(audio, batch_size=self.batch_size, print_progress=True)
+            progress_kwargs = self._progress_kwargs(model.transcribe, progress_callback)
+            if progress_kwargs and progress_callback is not None:
+                progress_callback(0)
+            result = model.transcribe(
+                audio, batch_size=self.batch_size, print_progress=True,
+                **progress_kwargs,
+            )
+            if progress_kwargs and progress_callback is not None:
+                progress_callback(100)
         logger.info(
             "[1/3] Transcription complete: %d segments, language=%s",
             len(result.get("segments", [])),
@@ -204,7 +213,11 @@ class AudioDiarizer:
 
         if progress_callback:
             progress_callback("TRANSCRIPTION")
-        result_trans = self._transcribe(audio, language)
+        def transcription_progress(percent: float):
+            if stage_progress_callback:
+                stage_progress_callback("TRANSCRIPTION", percent)
+
+        result_trans = self._transcribe(audio, language, transcription_progress)
         model_loader.unload_whisper() # FREE RAM
         
         if progress_callback:

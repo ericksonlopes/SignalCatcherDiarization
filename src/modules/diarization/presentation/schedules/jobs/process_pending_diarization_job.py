@@ -4,6 +4,7 @@ import os
 import queue
 import traceback
 from time import monotonic
+from uuid import uuid4
 
 from src.core.config.settings import settings
 from src.modules.diarization.infrastructure.repositories.diarization_task_repository import (
@@ -51,8 +52,7 @@ def _diarization_worker(k_dict, p_queue):
         )
 
         diarizer = AudioDiarizer(
-            hf_token=k_dict["hf_token"],
-            model_size=k_dict["model_size"]
+            hf_token=k_dict["hf_token"], model_size=k_dict["model_size"]
         )
 
         def on_prog(step_val: str):
@@ -72,47 +72,53 @@ def _diarization_worker(k_dict, p_queue):
             "segments": [s.to_dict() for s in res.segments],
             "language": res.language,
             "duration": res.duration,
-            "speakers": res.speakers
+            "speakers": res.speakers,
         }
         p_queue.put({"type": "success", "result": res_json})
     except Exception as exc:
-        p_queue.put({"type": "error", "error": str(exc), "traceback": traceback.format_exc()})
+        p_queue.put(
+            {"type": "error", "error": str(exc), "traceback": traceback.format_exc()}
+        )
+
 
 def process_pending_diarization_tasks_job():
     """Busca tarefas pendentes na fila e as processa uma por uma."""
     logger.debug("Executando job de diarização...")
-    
+
     repository = DiarizationTaskRepository()
-    
+    repository.recover_interrupted_tasks()
+
     pending_tasks = repository.get_pending_tasks(limit=1)
-    
+
     if not pending_tasks:
         return
-        
+
     task = pending_tasks[0]
-    
+
     logger.info(f"Iniciando processamento da tarefa de diarização {task.id}")
     p = None
     progress_queue = None
     worker_succeeded = False
+    worker_token = str(uuid4())
     try:
-        repository.update_task_step(task.id, step="TRANSCRIPTION")
+        if not repository.claim_task(task.id, worker_token):
+            return
         file_path = task.file_path
         if settings.DOWNLOAD_YOUTUBE_PATH:
             rel_path = file_path.lstrip("/\\")
             rel_path = rel_path.replace("/", os.sep)
             file_path = os.path.join(settings.DOWNLOAD_YOUTUBE_PATH, rel_path)
-            
+
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
-            
+
         hf_token = settings.HF_TOKEN
         if not hf_token:
             raise ValueError("HF_TOKEN não está configurado.")
-            
+
         ctx = multiprocessing.get_context("spawn")
         progress_queue = ctx.Queue()
-        
+
         kwargs_dict = {
             "file_path": file_path,
             "language": task.language,
@@ -120,22 +126,40 @@ def process_pending_diarization_tasks_job():
             "min_speakers": task.min_speakers,
             "max_speakers": task.max_speakers,
             "hf_token": hf_token,
-            "model_size": task.model_size
+            "model_size": task.model_size,
         }
 
         p = ctx.Process(target=_diarization_worker, args=(kwargs_dict, progress_queue))
         p.start()
-        
+        last_heartbeat = monotonic()
+
         while True:
+            if monotonic() - last_heartbeat >= 15:
+                if not repository.renew_task_lease(task.id, worker_token):
+                    raise RuntimeError("Task cancelled or worker ownership expired")
+                last_heartbeat = monotonic()
             try:
                 msg = progress_queue.get(timeout=5.0)
                 if msg["type"] == "progress":
-                    repository.update_task_step(task.id, step=msg["step"])
+                    if not repository.update_task_step(
+                        task.id, step=msg["step"], worker_token=worker_token
+                    ):
+                        raise RuntimeError("Task no longer belongs to this worker")
                 elif msg["type"] == "stage_progress":
-                    repository.update_task_progress(task.id, msg["step"], msg["percent"])
+                    repository.update_task_progress(
+                        task.id, msg["step"], msg["percent"], worker_token=worker_token
+                    )
                 elif msg["type"] == "success":
-                    repository.update_task_step(task.id, step="COMPLETED", result_json=msg["result"])
-                    logger.info(f"Tarefa de diarização {task.id} finalizada com sucesso.")
+                    if not repository.update_task_step(
+                        task.id,
+                        step="COMPLETED",
+                        result_json=msg["result"],
+                        worker_token=worker_token,
+                    ):
+                        raise RuntimeError("Task no longer belongs to this worker")
+                    logger.info(
+                        f"Tarefa de diarização {task.id} finalizada com sucesso."
+                    )
                     worker_succeeded = True
                     break
                 elif msg["type"] == "error":
@@ -143,11 +167,15 @@ def process_pending_diarization_tasks_job():
                     raise RuntimeError(msg["error"])
             except queue.Empty:
                 if not p.is_alive():
-                    raise RuntimeError("O processo de diarização morreu inesperadamente (possível falta de memória / OOM Killer).")
-                    
+                    raise RuntimeError(
+                        "O processo de diarização morreu inesperadamente (possível falta de memória / OOM Killer)."
+                    )
+
     except Exception as e:
         logger.exception(f"Erro ao processar tarefa {task.id}")
-        repository.update_task_step(task.id, step="ERROR", error_message=str(e))
+        repository.update_task_step(
+            task.id, step="ERROR", error_message=str(e), worker_token=worker_token
+        )
     finally:
         # Do not leave inference running if persisting progress or results fails.
         try:

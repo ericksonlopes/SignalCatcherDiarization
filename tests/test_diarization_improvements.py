@@ -1,9 +1,10 @@
 """Focused regression tests, without downloading models or contacting PostgreSQL."""
+
 import importlib
 import sys
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,20 +30,29 @@ class DiarizationImprovementTests(unittest.TestCase):
 
         connector.ConnectorPostgres = connect
         config = ModuleType("src.core.config.settings")
-        config.settings = SimpleNamespace(DOWNLOAD_YOUTUBE_PATH=None, HF_TOKEN="test-token")
-        cls.module_patch = patch.dict(sys.modules, {
-            "src.core.config.settings": config,
-            "src.core.database.connector": connector,
-        })
+        config.settings = SimpleNamespace(
+            DOWNLOAD_YOUTUBE_PATH=None, HF_TOKEN="test-token"
+        )
+        cls.module_patch = patch.dict(
+            sys.modules,
+            {
+                "src.core.config.settings": config,
+                "src.core.database.connector": connector,
+            },
+        )
         cls.module_patch.start()
         cls.job = importlib.import_module(
             "src.modules.diarization.presentation.schedules.jobs.process_pending_diarization_job"
         )
-        cls.heavy_imports = [name for name in ("torch", "whisperx") if name in sys.modules]
+        cls.heavy_imports = [
+            name for name in ("torch", "whisperx") if name in sys.modules
+        ]
         cls.torch = MagicMock()
         cls.torch.cuda.is_available.return_value = False
         cls.whisperx = MagicMock()
-        cls.inference_patch = patch.dict(sys.modules, {"torch": cls.torch, "whisperx": cls.whisperx})
+        cls.inference_patch = patch.dict(
+            sys.modules, {"torch": cls.torch, "whisperx": cls.whisperx}
+        )
         cls.inference_patch.start()
         cls.audio = importlib.import_module(
             "src.modules.diarization.infrastructure.services.audio_diarizer"
@@ -62,7 +72,8 @@ class DiarizationImprovementTests(unittest.TestCase):
     def setUp(self):
         self.whisperx.reset_mock()
         with self.engine.begin() as connection:
-            connection.execute(text("""
+            connection.execute(
+                text("""
                 CREATE TABLE IF NOT EXISTS step_tracking (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_id VARCHAR NOT NULL,
@@ -72,14 +83,21 @@ class DiarizationImprovementTests(unittest.TestCase):
                     changed_at TIMESTAMP NOT NULL,
                     details VARCHAR
                 )
-            """))
+            """)
+            )
 
     def _history(self, task_id):
         with self.engine.connect() as connection:
-            return connection.execute(
-                text("SELECT * FROM step_tracking WHERE entity_id=:task_id ORDER BY id"),
-                {"task_id": task_id},
-            ).mappings().all()
+            return (
+                connection.execute(
+                    text(
+                        "SELECT * FROM step_tracking WHERE entity_id=:task_id ORDER BY id"
+                    ),
+                    {"task_id": task_id},
+                )
+                .mappings()
+                .all()
+            )
 
     def test_linked_task_records_entire_history_under_task_identity(self):
         repository = self.repo.DiarizationTaskRepository()
@@ -87,12 +105,26 @@ class DiarizationImprovementTests(unittest.TestCase):
         task = repository.create_task(
             file_path="audio.wav", entity_id="video", entity_type="YOUTUBE"
         )
-        for step in ["TRANSCRIPTION", "ALIGNMENT", "DIARIZATION", "DIARIZED", "COMPLETED"]:
+        for step in [
+            "TRANSCRIPTION",
+            "ALIGNMENT",
+            "DIARIZATION",
+            "DIARIZED",
+            "COMPLETED",
+        ]:
             repository.update_task_step(task.id, step)
         rows = self._history(task.id)
-        self.assertEqual([row["new_step"] for row in rows], [
-            "PENDING", "TRANSCRIPTION", "ALIGNMENT", "DIARIZATION", "DIARIZED", "COMPLETED"
-        ])
+        self.assertEqual(
+            [row["new_step"] for row in rows],
+            [
+                "PENDING",
+                "TRANSCRIPTION",
+                "ALIGNMENT",
+                "DIARIZATION",
+                "DIARIZED",
+                "COMPLETED",
+            ],
+        )
         self.assertTrue(all(row["entity_type"] == "diarization" for row in rows))
         self.assertIsNone(rows[0]["previous_step"])
         self.assertEqual(rows[-1]["previous_step"], "DIARIZED")
@@ -113,15 +145,54 @@ class DiarizationImprovementTests(unittest.TestCase):
 
     def test_two_tasks_for_same_video_keep_separate_histories(self):
         repository = self.repo.DiarizationTaskRepository()
-        first = repository.create_task(file_path="first.wav", entity_id="same-video", entity_type="YOUTUBE")
-        second = repository.create_task(file_path="second.wav", entity_id="same-video", entity_type="YOUTUBE")
+        first = repository.create_task(
+            file_path="first.wav", entity_id="same-video", entity_type="YOUTUBE"
+        )
         repository.update_task_step(first.id, "COMPLETED")
+        second = repository.create_task(
+            file_path="second.wav", entity_id="same-video", entity_type="YOUTUBE"
+        )
         repository.update_task_step(second.id, "ERROR")
-        self.assertEqual([row["new_step"] for row in self._history(first.id)], ["PENDING", "COMPLETED"])
-        self.assertEqual([row["new_step"] for row in self._history(second.id)], ["PENDING", "ERROR"])
+        self.assertEqual(
+            [row["new_step"] for row in self._history(first.id)],
+            ["PENDING", "COMPLETED"],
+        )
+        self.assertEqual(
+            [row["new_step"] for row in self._history(second.id)], ["PENDING", "ERROR"]
+        )
 
     def test_scheduler_import_does_not_load_inference_libraries(self):
         self.assertEqual(self.heavy_imports, [])
+
+    def test_worker_claim_recovery_and_cancelled_result_are_guarded(self):
+        repository = self.repo.DiarizationTaskRepository()
+        task = repository.create_task("claim.wav")
+        self.assertTrue(repository.claim_task(task.id, "worker-one"))
+        self.assertFalse(repository.claim_task(task.id, "worker-two"))
+        self.assertTrue(repository.renew_task_lease(task.id, "worker-one"))
+        self.assertEqual(repository.recover_interrupted_tasks(), 0)
+        with self.session_factory() as session:
+            stored = session.get(self.model, task.id)
+            stored.lease_expires_at = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            ) - timedelta(seconds=1)
+            session.commit()
+        self.assertEqual(repository.recover_interrupted_tasks(), 1)
+        self.assertFalse(
+            repository.update_task_step(task.id, "COMPLETED", worker_token="worker-one")
+        )
+        self.assertEqual(repository.get_task(task.id).step, "CANCELLED")
+        self.assertEqual(self._history(task.id)[-1]["new_step"], "CANCELLED")
+
+    def test_duplicate_worker_requests_reuse_active_task(self):
+        repository = self.repo.DiarizationTaskRepository()
+        first = repository.create_task(
+            "repeat.wav", entity_id="repeat-video", entity_type="YOUTUBE"
+        )
+        second = repository.create_task(
+            "repeat.wav", entity_id="repeat-video", entity_type="YOUTUBE"
+        )
+        self.assertEqual(first.id, second.id)
 
     def test_progress_updates_are_monotonic_and_do_not_add_history(self):
         repository = self.repo.DiarizationTaskRepository()
@@ -150,8 +221,12 @@ class DiarizationImprovementTests(unittest.TestCase):
             progress_callback(70)
             return {"segments": []}
 
-        with patch.object(self.whisperx, "align", align), \
-                patch.object(self.audio.model_loader, "get_align_model", return_value=(object(), {})):
+        with (
+            patch.object(self.whisperx, "align", align),
+            patch.object(
+                self.audio.model_loader, "get_align_model", return_value=(object(), {})
+            ),
+        ):
             self.audio.AudioDiarizer("token")._align(
                 {"segments": [], "language": "pt"}, object(), None, values.append
             )
@@ -166,39 +241,69 @@ class DiarizationImprovementTests(unittest.TestCase):
             return object()
 
         self.whisperx.assign_word_speakers.side_effect = lambda _, result: result
-        with patch.object(self.audio.model_loader, "get_diarization_pipeline", return_value=pipeline):
+        with patch.object(
+            self.audio.model_loader, "get_diarization_pipeline", return_value=pipeline
+        ):
             self.audio.AudioDiarizer("token")._diarize(
-                object(), {"segments": [], "language": "pt"}, None, None, None, values.append
+                object(),
+                {"segments": [], "language": "pt"},
+                None,
+                None,
+                None,
+                values.append,
             )
         self.assertEqual(values, [0, 45, 100])
 
     def test_reporter_throttles_updates_and_resets_for_next_stage(self):
         queue = MagicMock()
         reporter = self.job.StageProgressReporter(queue)
-        with patch.object(self.job, "monotonic", side_effect=[10, 10.5, 12.1, 12.2, 12.3, 12.4]):
-            for step, value in [("ALIGNMENT", 0), ("ALIGNMENT", 10), ("ALIGNMENT", 20),
-                                ("ALIGNMENT", 15), ("ALIGNMENT", 100), ("DIARIZATION", 0)]:
+        with patch.object(
+            self.job, "monotonic", side_effect=[10, 10.5, 12.1, 12.2, 12.3, 12.4]
+        ):
+            for step, value in [
+                ("ALIGNMENT", 0),
+                ("ALIGNMENT", 10),
+                ("ALIGNMENT", 20),
+                ("ALIGNMENT", 15),
+                ("ALIGNMENT", 100),
+                ("DIARIZATION", 0),
+            ]:
                 reporter(step, value)
-        self.assertEqual([call.args[0] for call in queue.put.call_args_list], [
-            {"type": "stage_progress", "step": "ALIGNMENT", "percent": 0},
-            {"type": "stage_progress", "step": "ALIGNMENT", "percent": 20},
-            {"type": "stage_progress", "step": "ALIGNMENT", "percent": 100},
-            {"type": "stage_progress", "step": "DIARIZATION", "percent": 0},
-        ])
+        self.assertEqual(
+            [call.args[0] for call in queue.put.call_args_list],
+            [
+                {"type": "stage_progress", "step": "ALIGNMENT", "percent": 0},
+                {"type": "stage_progress", "step": "ALIGNMENT", "percent": 20},
+                {"type": "stage_progress", "step": "ALIGNMENT", "percent": 100},
+                {"type": "stage_progress", "step": "DIARIZATION", "percent": 0},
+            ],
+        )
 
     def test_job_persists_progress_separately_from_transitions(self):
-        _, repository = self._run_job([
-            {"type": "progress", "step": "ALIGNMENT"},
-            {"type": "stage_progress", "step": "ALIGNMENT", "percent": 65},
-            {"type": "success", "result": {"language": "pt"}},
-        ], alive=False)
-        repository.update_task_progress.assert_called_once_with("task", "ALIGNMENT", 65)
-        self.assertEqual([call.kwargs["step"] for call in repository.update_task_step.call_args_list],
-                         ["TRANSCRIPTION", "ALIGNMENT", "COMPLETED"])
+        _, repository = self._run_job(
+            [
+                {"type": "progress", "step": "ALIGNMENT"},
+                {"type": "stage_progress", "step": "ALIGNMENT", "percent": 65},
+                {"type": "success", "result": {"language": "pt"}},
+            ],
+            alive=False,
+        )
+        repository.update_task_progress.assert_called_once_with(
+            "task", "ALIGNMENT", 65, worker_token=unittest.mock.ANY
+        )
+        self.assertEqual(
+            [
+                call.kwargs["step"]
+                for call in repository.update_task_step.call_args_list
+            ],
+            ["ALIGNMENT", "COMPLETED"],
+        )
 
     def test_alignment_preserves_detected_language(self):
         self.whisperx.align.return_value = {"segments": [], "word_segments": []}
-        with patch.object(self.audio.model_loader, "get_align_model", return_value=(object(), {})):
+        with patch.object(
+            self.audio.model_loader, "get_align_model", return_value=(object(), {})
+        ):
             result = self.audio.AudioDiarizer("token")._align(
                 {"segments": [], "language": "pt"}, object(), None
             )
@@ -206,15 +311,25 @@ class DiarizationImprovementTests(unittest.TestCase):
 
     def test_failed_alignment_preserves_original_transcript(self):
         original = {"segments": [], "language": "pt"}
-        with patch.object(self.audio.model_loader, "get_align_model", side_effect=RuntimeError("unavailable")):
+        with patch.object(
+            self.audio.model_loader,
+            "get_align_model",
+            side_effect=RuntimeError("unavailable"),
+        ):
             result = self.audio.AudioDiarizer("token")._align(original, object(), None)
         self.assertIs(result, original)
 
     def test_segment_assignment_retains_aligned_output_without_word_work(self):
         transcript = {
             "language": "pt",
-            "segments": [{"start": 1.234, "end": 2.345, "text": " Olá ",
-                          "words": [{"word": "Olá", "start": 1.234, "end": 2.345}]}],
+            "segments": [
+                {
+                    "start": 1.234,
+                    "end": 2.345,
+                    "text": " Olá ",
+                    "words": [{"word": "Olá", "start": 1.234, "end": 2.345}],
+                }
+            ],
             "word_segments": [{"word": "Olá"}],
         }
 
@@ -226,16 +341,24 @@ class DiarizationImprovementTests(unittest.TestCase):
 
         self.whisperx.assign_word_speakers.side_effect = assign
         pipeline = MagicMock()
-        with patch.object(self.audio.model_loader, "get_diarization_pipeline", return_value=pipeline):
+        with patch.object(
+            self.audio.model_loader, "get_diarization_pipeline", return_value=pipeline
+        ):
             segments, language = self.audio.AudioDiarizer("token")._diarize(
                 object(), transcript, 2, None, None
             )
         pipeline.assert_called_once_with(unittest.mock.ANY, num_speakers=2)
         self.assertEqual(language, "pt")
-        self.assertEqual(segments[0].to_dict(), {
-            "speaker": "SPEAKER_00", "start": 1.234, "end": 2.345,
-            "duration": 1.111, "text": "Olá",
-        })
+        self.assertEqual(
+            segments[0].to_dict(),
+            {
+                "speaker": "SPEAKER_00",
+                "start": 1.234,
+                "end": 2.345,
+                "duration": 1.111,
+                "text": "Olá",
+            },
+        )
 
     def test_timing_is_logged_even_when_stage_fails(self):
         with patch.object(self.audio, "perf_counter", side_effect=[10.0, 12.5]):
@@ -247,28 +370,45 @@ class DiarizationImprovementTests(unittest.TestCase):
 
     def _pipeline_progress(self, error=None):
         progress = []
-        with patch.object(self.audio.os.path, "exists", return_value=True), \
-                patch.object(self.audio, "load_whisperx_audio", return_value=SimpleNamespace(shape=(100,))), \
-                patch.object(self.audio.AudioDiarizer, "_transcribe", return_value={}), \
-                patch.object(self.audio.AudioDiarizer, "_align", return_value={}), \
-                patch.object(self.audio.AudioDiarizer, "_diarize", return_value=([], "pt"), side_effect=error), \
-                patch.object(self.audio.model_loader, "unload_whisper"), \
-                patch.object(self.audio.model_loader, "unload_align"), \
-                patch.object(self.audio.model_loader, "unload_diarization"):
+        with (
+            patch.object(self.audio.os.path, "exists", return_value=True),
+            patch.object(
+                self.audio,
+                "load_whisperx_audio",
+                return_value=SimpleNamespace(shape=(100,)),
+            ),
+            patch.object(self.audio.AudioDiarizer, "_transcribe", return_value={}),
+            patch.object(self.audio.AudioDiarizer, "_align", return_value={}),
+            patch.object(
+                self.audio.AudioDiarizer,
+                "_diarize",
+                return_value=([], "pt"),
+                side_effect=error,
+            ),
+            patch.object(self.audio.model_loader, "unload_whisper"),
+            patch.object(self.audio.model_loader, "unload_align"),
+            patch.object(self.audio.model_loader, "unload_diarization"),
+        ):
             if error:
                 with self.assertRaises(RuntimeError):
-                    self.audio.AudioDiarizer("token").run("audio.wav", progress_callback=progress.append)
+                    self.audio.AudioDiarizer("token").run(
+                        "audio.wav", progress_callback=progress.append
+                    )
             else:
-                self.audio.AudioDiarizer("token").run("audio.wav", progress_callback=progress.append)
+                self.audio.AudioDiarizer("token").run(
+                    "audio.wav", progress_callback=progress.append
+                )
         return progress
 
     def test_diarized_is_emitted_only_after_speaker_assignment_succeeds(self):
-        self.assertEqual(self._pipeline_progress(), [
-            "TRANSCRIPTION", "ALIGNMENT", "DIARIZATION", "DIARIZED"
-        ])
-        self.assertEqual(self._pipeline_progress(RuntimeError("inference failed")), [
-            "TRANSCRIPTION", "ALIGNMENT", "DIARIZATION"
-        ])
+        self.assertEqual(
+            self._pipeline_progress(),
+            ["TRANSCRIPTION", "ALIGNMENT", "DIARIZATION", "DIARIZED"],
+        )
+        self.assertEqual(
+            self._pipeline_progress(RuntimeError("inference failed")),
+            ["TRANSCRIPTION", "ALIGNMENT", "DIARIZATION"],
+        )
 
     def test_diarization_reaches_100_only_after_speaker_assignment(self):
         events = []
@@ -278,26 +418,41 @@ class DiarizationImprovementTests(unittest.TestCase):
             events.append("assigned")
             return [], "pt"
 
-        with patch.object(self.audio.os.path, "exists", return_value=True), \
-                patch.object(self.audio, "load_whisperx_audio", return_value=SimpleNamespace(shape=(100,))), \
-                patch.object(self.audio.AudioDiarizer, "_transcribe", return_value={}), \
-                patch.object(self.audio.AudioDiarizer, "_align", return_value={}), \
-                patch.object(self.audio.AudioDiarizer, "_diarize", side_effect=diarize), \
-                patch.object(self.audio.model_loader, "unload_whisper"), \
-                patch.object(self.audio.model_loader, "unload_align"), \
-                patch.object(self.audio.model_loader, "unload_diarization"):
+        with (
+            patch.object(self.audio.os.path, "exists", return_value=True),
+            patch.object(
+                self.audio,
+                "load_whisperx_audio",
+                return_value=SimpleNamespace(shape=(100,)),
+            ),
+            patch.object(self.audio.AudioDiarizer, "_transcribe", return_value={}),
+            patch.object(self.audio.AudioDiarizer, "_align", return_value={}),
+            patch.object(self.audio.AudioDiarizer, "_diarize", side_effect=diarize),
+            patch.object(self.audio.model_loader, "unload_whisper"),
+            patch.object(self.audio.model_loader, "unload_align"),
+            patch.object(self.audio.model_loader, "unload_diarization"),
+        ):
             self.audio.AudioDiarizer("token").run(
-                "audio.wav", stage_progress_callback=lambda step, percent: events.append((step, percent))
+                "audio.wav",
+                stage_progress_callback=lambda step, percent: events.append(
+                    (step, percent)
+                ),
             )
-        self.assertEqual(events, [("DIARIZATION", 99), "assigned", ("DIARIZATION", 100)])
+        self.assertEqual(
+            events, [("DIARIZATION", 99), "assigned", ("DIARIZATION", 100)]
+        )
 
     def test_older_library_without_callback_keeps_processing(self):
         def old_align(*args, return_char_alignments=False):
             return {"segments": []}
 
         values = []
-        with patch.object(self.whisperx, "align", old_align), \
-                patch.object(self.audio.model_loader, "get_align_model", return_value=(object(), {})):
+        with (
+            patch.object(self.whisperx, "align", old_align),
+            patch.object(
+                self.audio.model_loader, "get_align_model", return_value=(object(), {})
+            ),
+        ):
             result = self.audio.AudioDiarizer("token")._align(
                 {"segments": [], "language": "pt"}, object(), None, values.append
             )
@@ -306,11 +461,20 @@ class DiarizationImprovementTests(unittest.TestCase):
 
     def _run_job(self, messages, update_effect=None, start_error=None, alive=True):
         repository = MagicMock()
-        repository.get_pending_tasks.return_value = [SimpleNamespace(
-            id="task", file_path="audio.wav", language="pt", num_speakers=None,
-            min_speakers=None, max_speakers=None, model_size="large-v2",
-        )]
+        repository.get_pending_tasks.return_value = [
+            SimpleNamespace(
+                id="task",
+                file_path="audio.wav",
+                language="pt",
+                num_speakers=None,
+                min_speakers=None,
+                max_speakers=None,
+                model_size="large-v2",
+            )
+        ]
         repository.update_task_step.side_effect = update_effect
+        repository.claim_task.return_value = True
+        repository.renew_task_lease.return_value = True
         process = MagicMock()
         process.pid = None if start_error else 123
         process.start.side_effect = start_error
@@ -320,9 +484,13 @@ class DiarizationImprovementTests(unittest.TestCase):
         context = MagicMock()
         context.Process.return_value = process
         context.Queue.return_value = progress
-        with patch.object(self.job, "DiarizationTaskRepository", return_value=repository), \
-                patch.object(self.job.multiprocessing, "get_context", return_value=context), \
-                patch.object(self.job.os.path, "exists", return_value=True):
+        with (
+            patch.object(
+                self.job, "DiarizationTaskRepository", return_value=repository
+            ),
+            patch.object(self.job.multiprocessing, "get_context", return_value=context),
+            patch.object(self.job.os.path, "exists", return_value=True),
+        ):
             self.job.process_pending_diarization_tasks_job()
         progress.close.assert_called_once()
         progress.join_thread.assert_called_once()
@@ -332,7 +500,7 @@ class DiarizationImprovementTests(unittest.TestCase):
     def test_database_failure_stops_child_and_closes_resources(self):
         process, repository = self._run_job(
             [{"type": "progress", "step": "ALIGNMENT"}],
-            update_effect=[None, RuntimeError("database unavailable"), None],
+            update_effect=[RuntimeError("database unavailable"), None],
         )
         process.terminate.assert_called_once()
         process.join.assert_any_call(timeout=5.0)
@@ -340,20 +508,29 @@ class DiarizationImprovementTests(unittest.TestCase):
 
     def test_success_waits_for_child_without_terminating_it(self):
         process, repository = self._run_job(
-            [{"type": "success", "result": {"language": "pt"}}], alive=False,
+            [{"type": "success", "result": {"language": "pt"}}],
+            alive=False,
         )
         process.join.assert_any_call(timeout=5.0)
         process.terminate.assert_not_called()
-        self.assertEqual(repository.update_task_step.call_args.kwargs["step"], "COMPLETED")
+        self.assertEqual(
+            repository.update_task_step.call_args.kwargs["step"], "COMPLETED"
+        )
 
     def test_worker_persists_diarized_before_completed(self):
-        _, repository = self._run_job([
-            {"type": "progress", "step": "DIARIZED"},
-            {"type": "success", "result": {"language": "pt"}},
-        ], alive=False)
+        _, repository = self._run_job(
+            [
+                {"type": "progress", "step": "DIARIZED"},
+                {"type": "success", "result": {"language": "pt"}},
+            ],
+            alive=False,
+        )
         self.assertEqual(
-            [call.kwargs["step"] for call in repository.update_task_step.call_args_list],
-            ["TRANSCRIPTION", "DIARIZED", "COMPLETED"],
+            [
+                call.kwargs["step"]
+                for call in repository.update_task_step.call_args_list
+            ],
+            ["DIARIZED", "COMPLETED"],
         )
 
     def test_process_start_failure_still_closes_resources(self):
@@ -367,7 +544,9 @@ class DiarizationImprovementTests(unittest.TestCase):
         with self.engine.begin() as connection:
             connection.execute(text("DROP TABLE step_tracking"))
         with self.session_factory() as session:
-            task = self.model(file_path="audio.wav", entity_id="video", entity_type="youtube_video")
+            task = self.model(
+                file_path="audio.wav", entity_id="video", entity_type="youtube_video"
+            )
             session.add(task)
             session.commit()
             task_id = task.id

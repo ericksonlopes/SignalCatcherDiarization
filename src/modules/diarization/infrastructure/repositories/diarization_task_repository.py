@@ -1,7 +1,7 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from src.core.database.connector import ConnectorPostgres
@@ -10,6 +10,15 @@ from src.modules.diarization.infrastructure.repositories.models.diarization_task
 )
 
 logger = logging.getLogger(__name__)
+ACTIVE_STEPS = (
+    "STARTED",
+    "PROCESSING",
+    "TRANSCRIPTION",
+    "ALIGNMENT",
+    "DIARIZATION",
+    "DIARIZED",
+)
+LEASE_SECONDS = 120
 
 
 class DiarizationTaskRepository:
@@ -43,7 +52,9 @@ class DiarizationTaskRepository:
                     },
                 )
         except Exception:
-            logger.exception("Failed to record diarization transition for task %s", task.id)
+            logger.exception(
+                "Failed to record diarization transition for task %s", task.id
+            )
 
     def create_task(
         self,
@@ -57,6 +68,30 @@ class DiarizationTaskRepository:
         model_size: str = "large-v2",
     ) -> DiarizationTaskModel:
         with ConnectorPostgres() as db:
+            if entity_id:
+                if db.get_bind().dialect.name == "postgresql":
+                    db.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                        {"key": f"diarization:{entity_type}:{entity_id}"},
+                    )
+                active = (
+                    db.query(DiarizationTaskModel)
+                    .filter(
+                        DiarizationTaskModel.entity_id == entity_id,
+                        DiarizationTaskModel.entity_type == entity_type,
+                        DiarizationTaskModel.step.in_(("PENDING", *ACTIVE_STEPS)),
+                    )
+                    .order_by(
+                        DiarizationTaskModel.created_at.desc(),
+                        DiarizationTaskModel.id.desc(),
+                    )
+                    .first()
+                )
+                if active:
+                    db.commit()
+                    db.refresh(active)
+                    db.expunge(active)
+                    return active
             new_task = DiarizationTaskModel(
                 file_path=file_path,
                 step="PENDING",
@@ -78,7 +113,11 @@ class DiarizationTaskRepository:
 
     def get_task(self, task_id: str) -> DiarizationTaskModel | None:
         with ConnectorPostgres() as db:
-            task = db.query(DiarizationTaskModel).filter(DiarizationTaskModel.id == task_id).first()
+            task = (
+                db.query(DiarizationTaskModel)
+                .filter(DiarizationTaskModel.id == task_id)
+                .first()
+            )
             if task:
                 db.expunge(task)
             return task
@@ -102,10 +141,20 @@ class DiarizationTaskRepository:
         step: str,
         result_json: dict | None = None,
         error_message: str | None = None,
-    ) -> None:
+        worker_token: str | None = None,
+    ) -> bool:
         with ConnectorPostgres() as db:
-            task = db.query(DiarizationTaskModel).filter(DiarizationTaskModel.id == task_id).first()
+            task = (
+                db.query(DiarizationTaskModel)
+                .filter(DiarizationTaskModel.id == task_id)
+                .with_for_update()
+                .first()
+            )
             if task:
+                if worker_token is not None and (
+                    task.worker_token != worker_token or task.step not in ACTIVE_STEPS
+                ):
+                    return False
                 old_step = task.step
                 task.step = step
                 if old_step != step:
@@ -114,25 +163,109 @@ class DiarizationTaskRepository:
                     task.result_json = result_json
                 if error_message is not None:
                     task.error_message = error_message
+                if step in {"COMPLETED", "ERROR", "CANCELLED"}:
+                    task.worker_token = None
+                    task.lease_expires_at = None
 
                 if old_step != step:
                     self._record_transition(db, task, old_step, step, error_message)
 
                 db.commit()
                 logger.info(f"Task {task_id} step updated to {step}")
+                return True
             else:
                 logger.warning(f"Task {task_id} not found for step update")
+                return False
 
-    def update_task_progress(self, task_id: str, step: str, percent: float) -> None:
+    def update_task_progress(
+        self, task_id: str, step: str, percent: float, worker_token: str | None = None
+    ) -> None:
         """Update telemetry without adding transitions or reviving cancelled tasks."""
-        if step not in {"ALIGNMENT", "DIARIZATION"}:
+        if step not in {"TRANSCRIPTION", "ALIGNMENT", "DIARIZATION"}:
             return
         value = max(0, min(100, int(percent)))
         with ConnectorPostgres() as db:
-            db.query(DiarizationTaskModel).filter(
+            query = db.query(DiarizationTaskModel).filter(
                 DiarizationTaskModel.id == task_id,
                 DiarizationTaskModel.step == step,
                 (DiarizationTaskModel.progress_percent.is_(None))
                 | (DiarizationTaskModel.progress_percent < value),
-            ).update({DiarizationTaskModel.progress_percent: value})
+            )
+            if worker_token is not None:
+                query = query.filter(DiarizationTaskModel.worker_token == worker_token)
+            query.update({DiarizationTaskModel.progress_percent: value})
             db.commit()
+
+    def claim_task(self, task_id: str, token: str) -> bool:
+        with ConnectorPostgres() as db:
+            task = (
+                db.query(DiarizationTaskModel)
+                .filter(
+                    DiarizationTaskModel.id == task_id,
+                    DiarizationTaskModel.step == "PENDING",
+                )
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if task is None:
+                return False
+            task.worker_token = token
+            task.lease_expires_at = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            ) + timedelta(seconds=LEASE_SECONDS)
+            task.progress_percent = None
+            task.step = "TRANSCRIPTION"
+            self._record_transition(db, task, "PENDING", "TRANSCRIPTION")
+            db.commit()
+            return True
+
+    def renew_task_lease(self, task_id: str, token: str) -> bool:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with ConnectorPostgres() as db:
+            count = (
+                db.query(DiarizationTaskModel)
+                .filter(
+                    DiarizationTaskModel.id == task_id,
+                    DiarizationTaskModel.worker_token == token,
+                    DiarizationTaskModel.step.in_(ACTIVE_STEPS),
+                    DiarizationTaskModel.lease_expires_at > now,
+                )
+                .update(
+                    {
+                        DiarizationTaskModel.lease_expires_at: now
+                        + timedelta(seconds=LEASE_SECONDS)
+                    }
+                )
+            )
+            db.commit()
+            return count == 1
+
+    def recover_interrupted_tasks(self, include_legacy: bool = False) -> int:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with ConnectorPostgres() as db:
+            expired = DiarizationTaskModel.lease_expires_at <= now
+            if include_legacy:
+                expired = or_(expired, DiarizationTaskModel.lease_expires_at.is_(None))
+            tasks = (
+                db.query(DiarizationTaskModel)
+                .filter(
+                    DiarizationTaskModel.step.in_(ACTIVE_STEPS),
+                    expired,
+                )
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+            for task in tasks:
+                previous = task.step
+                task.step = "CANCELLED"
+                task.progress_percent = None
+                task.worker_token = None
+                task.lease_expires_at = None
+                task.error_message = (
+                    "Processing interrupted: worker stopped renewing its lease."
+                )
+                self._record_transition(
+                    db, task, previous, "CANCELLED", task.error_message
+                )
+            db.commit()
+            return len(tasks)
