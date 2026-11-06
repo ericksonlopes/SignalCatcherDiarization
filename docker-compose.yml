@@ -17,6 +17,7 @@ services:
       LIST_LOG_LEVELS: ${LIST_LOG_LEVELS:-ERROR,WARNING,INFO}
       HF_TOKEN: ${HF_TOKEN:-}
       DOWNLOAD_YOUTUBE_PATH: /nas_root
+      GOOGLE_DRIVE_CREDENTIALS_PATH: ${GOOGLE_DRIVE_CREDENTIALS_PATH:-/nas_root/signalcatcher-505023-dcafb0efaeab.json}
     volumes:
       - nas_ssd:/nas_root
     dns:

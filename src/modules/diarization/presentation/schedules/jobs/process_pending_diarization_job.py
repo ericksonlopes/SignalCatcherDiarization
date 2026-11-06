@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import queue
 import traceback
+from contextlib import ExitStack
 from threading import Lock
 from time import monotonic
 from uuid import uuid4
@@ -203,11 +204,26 @@ def _process_pending_diarization_tasks_job(execution):
     progress_queue = None
     worker_succeeded = False
     worker_token = str(uuid4())
+    media_stack = ExitStack()
     try:
         if not repository.claim_task(task.id, worker_token):
             return
         file_path = task.file_path
-        if settings.DOWNLOAD_YOUTUBE_PATH:
+        if file_path.startswith("gdrive://"):
+            from src.modules.diarization.infrastructure.services.drive_media import drive_media
+
+            last_media_heartbeat = 0.0
+
+            def renew_media_lease():
+                nonlocal last_media_heartbeat
+                if monotonic() - last_media_heartbeat >= 5:
+                    execution.ensure_owned()
+                    if not repository.renew_task_lease(task.id, worker_token):
+                        raise WorkerStopped()
+                    last_media_heartbeat = monotonic()
+
+            file_path = media_stack.enter_context(drive_media(file_path, renew_media_lease))
+        elif settings.DOWNLOAD_YOUTUBE_PATH:
             rel_path = file_path.lstrip("/\\")
             rel_path = rel_path.replace("/", os.sep)
             file_path = os.path.join(settings.DOWNLOAD_YOUTUBE_PATH, rel_path)
@@ -272,7 +288,8 @@ def _process_pending_diarization_tasks_job(execution):
             except queue.Empty:
                 if not p.is_alive():
                     raise RuntimeError(
-                        "O processo de diarização morreu inesperadamente (possível falta de memória / OOM Killer)."
+                        "O processo de diarização morreu inesperadamente "
+                        "(possível falta de memória / OOM Killer)."
                     )
 
     except WorkerStopped:
@@ -301,6 +318,9 @@ def _process_pending_diarization_tasks_job(execution):
                 finally:
                     p.close()
         finally:
-            if progress_queue is not None:
-                progress_queue.close()
-                progress_queue.join_thread()
+            try:
+                if progress_queue is not None:
+                    progress_queue.close()
+                    progress_queue.join_thread()
+            finally:
+                media_stack.close()

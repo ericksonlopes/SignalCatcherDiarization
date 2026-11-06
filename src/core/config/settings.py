@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     LIST_LOG_LEVELS: Optional[str] = None
     HF_TOKEN: Optional[str] = None
     DOWNLOAD_YOUTUBE_PATH: Optional[str] = "D:\\"
+    GOOGLE_DRIVE_CREDENTIALS_PATH: str = "/nas_root/signalcatcher-505023-dcafb0efaeab.json"
 
     @property
     def database_url(self) -> str:

@@ -20,6 +20,7 @@ dependencies = [
     "torch",
     "torchvision",
     "torchaudio",
+    "google-auth[requests]>=2.0",
 ]
 
 [tool.uv.sources]
